@@ -1,13 +1,15 @@
 // https://github.com/esnard/dragster/blob/master/dragster.c
 
-use std::hash::{ Hash, Hasher };
-use std::collections::HashSet;
+use rand::{ thread_rng, Rng };
+use std::sync::{ Arc, Mutex };
+use threadpool::Builder;
 
 type Int = i128;
 type Time = f32;
-type Inputs = [ Input; MAX_FRAMES as usize + 1 ];
+type Inputs = Vec<Input>;
 
-const MAX_FRAMES: Int = 167; // 167 is sufficient but let's do 200 for safety
+const INPUT_PROBABILITY: f64 = 0.5;
+// const MAX_FRAMES: Int = 167; // 167 is sufficient but let's do 200 for safety
 
 const INITIAL_GEAR: Int = 0;
 const INITIAL_SPEED: Int = 0;
@@ -17,9 +19,9 @@ const MIN_WINNING_DISTANCE: Int = 97 * 256;
 const MAX_TACHOMETER: Int = 32;
 const MAX_FRAME_COUNTER: Int = 16;
 const MAX_GEAR: Int = 4;
-const MAX_SPEED: Int = 256;
+// const MAX_SPEED: Int = 256;
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy)]
+#[derive(Eq, PartialEq, Clone, Copy, Debug)]
 struct Input {
     clutch: bool,
     shift: bool,
@@ -32,12 +34,9 @@ impl Input {
             shift,
         }
     }
-    fn default() -> Self {
-        Input::new(false, false)
-    }
 }
 
-#[derive(Eq, PartialEq, Clone, Copy)]
+#[derive(Eq, PartialEq, Clone, Debug)]
 struct GameState {
     timer: Int,
     frame_counter: Int,
@@ -46,54 +45,43 @@ struct GameState {
     distance: Int,
     speed: Int,
     gear: Int,
+    blown: bool,
     initial_tachometer: Int,
     initial_frame_counter: Int,
     inputs: Inputs,
 }
 
-impl Hash for GameState {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inputs[self.timer as usize - 1].shift.hash(state);
-        self.gear.hash(state);
-        self.speed.hash(state);
-        self.tachometer.hash(state);
-        self.tachometer_diff.hash(state);
-    }
-}
-
 impl GameState {
-    fn new(tachometer: Int, frame_counter: Int, clutch: bool, shift: bool) -> Self {
-        let mut state = Self {
-            timer: 1,
-            frame_counter: frame_counter,
-            tachometer: tachometer,
+    fn new() -> Self {
+        Self {
+            timer: 0,
+            frame_counter: 0,
+            tachometer: 0,
             tachometer_diff: 0,
             distance: 0,
             speed: INITIAL_SPEED,
             gear: INITIAL_GEAR,
-            initial_tachometer: tachometer,
-            initial_frame_counter: frame_counter,
-            inputs: [ Input::default(); MAX_FRAMES as usize + 1 ],
-        };
-        state.inputs[0] = Input::new(clutch, shift);
-        state
+            blown: false,
+            initial_tachometer: 0,
+            initial_frame_counter: 0,
+            inputs: vec![],
+        }
     }
     fn default() -> Self {
-        Self::new(0, 0, false, false)
+        Self::new()
     }
     fn state_timer(&self) -> Time {
         (self.timer as Time * 3.34).trunc() / 100.0
     }
     fn game_step(&mut self, clutch: bool, shift: bool) {
-        if self.timer >= MAX_FRAMES { return }
-        self.inputs[self.timer as usize] = Input::new(clutch, shift);
+        self.inputs.push(Input::new(clutch, shift));
         self.timer += 1;
         self.frame_counter = (self.frame_counter + 2) % MAX_FRAME_COUNTER;
 
         // Update gear and tachometer.
         let gear_value: Int = if self.gear > 2 { (2 as Int).pow(self.gear as u32 - 1) } else { 1 };
 
-        if self.inputs[self.timer as usize - 2].shift {
+        if self.inputs[self.inputs.len() - 1].shift {
             self.gear = if self.gear >= MAX_GEAR { MAX_GEAR } else { self.gear + 1 };
             self.tachometer -= self.tachometer_diff + if !clutch { -3 } else { 3 };
         } else {
@@ -106,19 +94,23 @@ impl GameState {
 
         self.tachometer = self.tachometer.max(0);
 
+        if self.tachometer >= MAX_TACHOMETER {
+            self.blown = true
+        }
+
         // Compute the speed limit.
         let speed_limit: Int = self.tachometer * gear_value
             + if self.tachometer >= 20 && self.gear > 2 { (2 as Int).pow(self.gear as u32 - 2) } else { 0 };
 
         // Update tachometer difference, which post_tachometer - tachometer.
-        if self.inputs[self.timer as usize - 2].shift {
+        if self.inputs[self.inputs.len() - 1].shift {
             self.tachometer_diff = 0;
         } else {
             self.tachometer_diff = if speed_limit - self.speed >= 16 { 1 } else { 0 }
         }
 
         // Update speed
-        if self.gear > 0 && self.inputs[self.timer as usize - 1].shift {
+        if self.gear > 0 && self.inputs[self.inputs.len() - 1].shift {
             if self.speed > speed_limit {
                 self.speed -= 1;
             } else if self.speed < speed_limit {
@@ -138,12 +130,13 @@ impl GameState {
             distance: self.distance,
             speed: self.speed,
             gear: self.gear,
+            blown: self.blown,
             initial_tachometer: self.initial_tachometer,
             initial_frame_counter: self.initial_frame_counter,
-            inputs: self.inputs,
+            inputs: self.inputs.clone(),
         };
 
-        for frame in 0..=MAX_FRAMES as usize {
+        for frame in 0..self.inputs.len() {
             let clutch = self.inputs[frame].clutch;
             let shift = self.inputs[frame].shift;
 
@@ -162,94 +155,46 @@ impl GameState {
         println!("Initial frame_counter: {}", self.initial_frame_counter);
         println!("Initial tachometer: {}", self.initial_tachometer);
     }
+    fn is_arrived(&self) -> bool {
+        self.distance >= MIN_WINNING_DISTANCE
+    }
+}
+
+fn spawn_game() -> Time {
+    let mut state = GameState::default();
+            
+    loop {
+        let clutch = thread_rng().gen_bool(INPUT_PROBABILITY);
+        let shift = thread_rng().gen_bool(INPUT_PROBABILITY);
+        state.game_step(clutch, shift);
+        if state.is_arrived() || state.blown { break }
+    }
+
+    if state.blown {
+        Time::INFINITY
+    } else {
+        state.state_timer()
+    }
 }
 
 fn main() {
-    let frame_counter = 0;
-    let tachometer = 0;
-    let clutch = false;
-    let shift = false;
+    let pool = Builder::new().build();
+    let best_time = Arc::new(Mutex::new(Time::INFINITY));
+    let attempts = Arc::new(Mutex::new(0));
 
-    let mut best_state = GameState::new(tachometer, frame_counter, clutch, shift);
-    best_state.timer = MAX_FRAMES;
-    best_state.distance = 0;
+    loop {
+        let best_time = best_time.clone();
+        let attempts = attempts.clone();
 
-    let mut states: HashSet<GameState> = HashSet::new();
-    let mut next_states: HashSet<GameState> = HashSet::new();
-
-    let mut total_simulations: u128 = 0;
-
-    for frame_counter in (0..MAX_FRAME_COUNTER).step_by(2) {
-        states = HashSet::new();
-        next_states = HashSet::new();
-
-        println!("Now testing all configurations with an initial frame counter equal to {}.", frame_counter);
-
-        // Generating initial states, based on OmniGamer's model.
-        for tachometer in (0..MAX_TACHOMETER).step_by(3) {
-            for clutch in 0..=1 {
-                for shift in 0..=1 {
-                    let initial_state = GameState::new(tachometer, frame_counter, clutch == 1, shift == 1);
-                    states.insert(initial_state);
-                }
+        pool.execute(move || {
+            let time = spawn_game();
+            let mut best_time = best_time.lock().unwrap();
+            let mut attempts = attempts.lock().unwrap();
+            if &time < &best_time {
+                *best_time = time;
+                println!("{} | {:?}", best_time, attempts);
             }
-        }
-    }
-
-    let mut stop_configuration = false;
-
-    /*
-        This is the main loop: we generate all possible states from previous
-        generated ones, dropping those who won't be able to finish, and using
-        deduplication to greatly reduce the search space.
-    */
-    for frame in 1..=MAX_FRAMES {
-        if stop_configuration { break }
-
-        for current_state in states.iter() {
-            if current_state.timer == frame {
-                for clutch in 0..=1 {
-                    for shift in 0..=1 {
-                        let mut next_state = current_state.clone();
-                        next_state.game_step(clutch == 1, shift == 1);
-                        total_simulations += 1;
-
-                        /*
-                        * Dropping states which can't win anything.
-                        *
-                        * Todo: use bestState to detect which states won't
-                        * be better than the best computed frame.
-                        */
-                        if next_state.tachometer < MAX_TACHOMETER && next_state.distance + MAX_SPEED * (MAX_FRAMES - frame) >= MIN_WINNING_DISTANCE {
-                            if next_state.distance >= MIN_WINNING_DISTANCE {
-                                if next_state.timer < best_state.timer || next_state.timer == best_state.timer && next_state.distance > best_state.distance {
-                                    best_state = next_state;
-                                }
-                                stop_configuration = true;
-                            }
-
-                            /*
-                            * If a state collision occurs, it's safe to
-                            * keep the one which has the greatest distance.
-                            */
-                            if next_state.distance >= next_states.get(&next_state).unwrap_or(&GameState::default()).distance {
-                                next_states.insert(next_state);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        states = next_states.clone();
-    }
-
-    println!();
-
-    if 0 == best_state.distance {
-        println!("It's not possible to do the race under {}s.", best_state.state_timer());
-        println!("{} simulations were performed.", total_simulations);
-
-        best_state.debug_state(true);
+            *attempts += 1;
+        });
     }
 }
